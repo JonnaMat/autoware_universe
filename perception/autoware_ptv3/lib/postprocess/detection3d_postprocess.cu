@@ -18,12 +18,9 @@
 #include <autoware/cuda_utils/cuda_unique_ptr.hpp>
 
 #include <cuda_runtime.h>
-#include <thrust/copy.h>
-#include <thrust/count.h>
-#include <thrust/execution_policy.h>
-#include <thrust/sort.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace autoware::ptv3
 {
@@ -31,19 +28,7 @@ namespace autoware::ptv3
 namespace
 {
 constexpr int k_block_size = 256;
-
-struct IsScoreNonZero
-{
-  __device__ bool operator()(const Box3D & box) const { return box.score > 0.0f; }
-};
-
-struct IsScoreGreaterThan
-{
-  __device__ bool operator()(const Box3D & lhs, const Box3D & rhs) const
-  {
-    return lhs.score > rhs.score;
-  }
-};
+constexpr std::size_t k_max_dynamic_shared_bytes = 48 * 1024;
 
 // Decode one Detection3D proposal per thread into a Box3D. Rejected proposals keep score 0 and are
 // compacted away by process(). All boundary tensors are pinned to float32 and integer types
@@ -136,6 +121,42 @@ void launchDecodeDetection3DToBoxes(
     post_center_range_d, score_thresholds_d, dist_bin_limits_d, num_dist_bins,
     yaw_norm_thresholds_d, has_twist, out_boxes_d);
 }
+
+// Compact the kept boxes (score > 0) in descending score order, ties in proposal order.
+// Scores are staged in num_proposals * 4 bytes of dynamic shared memory.
+__global__ void compactSortedBoxesKernel(
+  const Box3D * __restrict__ raw_boxes, int num_proposals, Box3D * __restrict__ out_boxes,
+  int * __restrict__ num_out)
+{
+  extern __shared__ float scores[];
+  for (int j = threadIdx.x; j < num_proposals; j += blockDim.x) {
+    scores[j] = raw_boxes[j].score;
+  }
+  __syncthreads();
+
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_proposals) {
+    return;
+  }
+
+  const float score = scores[i];
+  int rank = 0;
+  int count = 0;
+  for (int j = 0; j < num_proposals; ++j) {
+    const float other = scores[j];
+    if (other > 0.0f) {
+      ++count;
+      rank += (other > score || (other == score && j < i)) ? 1 : 0;
+    }
+  }
+
+  if (score > 0.0f) {
+    out_boxes[rank] = raw_boxes[i];
+  }
+  if (i == 0) {
+    *num_out = count;
+  }
+}
 }  // namespace
 
 Detection3DPostprocess::Detection3DPostprocess(const PTv3Config & config, cudaStream_t stream)
@@ -144,6 +165,9 @@ Detection3DPostprocess::Detection3DPostprocess(const PTv3Config & config, cudaSt
   passing_boxes_d_(config.num_proposals_),
   yaw_norm_thresholds_d_(config.yaw_norm_thresholds_.begin(), config.yaw_norm_thresholds_.end())
 {
+  if (config_.num_proposals_ * sizeof(float) > k_max_dynamic_shared_bytes) {
+    throw std::runtime_error("num_proposals exceeds the shared memory of compactSortedBoxesKernel");
+  }
   post_center_range_d_ = autoware::cuda_utils::make_unique<float[]>(6);
   CHECK_CUDA_ERROR(cudaMemcpyAsync(
     post_center_range_d_.get(), config_.post_center_range_.data(), 6 * sizeof(float),
@@ -160,6 +184,12 @@ Detection3DPostprocess::Detection3DPostprocess(const PTv3Config & config, cudaSt
   CHECK_CUDA_ERROR(cudaMemcpyAsync(
     dist_bin_limits_d_.get(), config_.distance_bin_upper_limits_.data(),
     config_.distance_bin_upper_limits_.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+  num_boxes_d_ = autoware::cuda_utils::make_unique<int>();
+  num_boxes_h_ = autoware::cuda_utils::make_unique_host<int>();
+  *num_boxes_h_ = 0;
+  boxes_h_ = autoware::cuda_utils::make_unique_host<Box3D[]>(
+    config_.num_proposals_, cudaHostAllocDefault);
 }
 
 cudaError_t Detection3DPostprocess::process(
@@ -167,7 +197,8 @@ cudaError_t Detection3DPostprocess::process(
   const float * center_d, const float * height_d, const float * dim_d, const float * rot_d,
   const float * vel_d, cudaStream_t stream)
 {
-  num_boxes_ = 0;
+  *num_boxes_h_ = 0;
+  const int num_proposals = static_cast<int>(config_.num_proposals_);
 
   launchDecodeDetection3DToBoxes(
     query_heatmap_score_d, query_labels_d, heatmap_d, center_d, height_d, dim_d, rot_d, vel_d,
@@ -179,18 +210,22 @@ cudaError_t Detection3DPostprocess::process(
     thrust::raw_pointer_cast(yaw_norm_thresholds_d_.data()), config_.has_twist_,
     thrust::raw_pointer_cast(raw_boxes_d_.data()), stream);
 
-  const auto policy = thrust::cuda::par.on(stream);
-  const auto passing_end = thrust::copy_if(
-    policy, raw_boxes_d_.begin(), raw_boxes_d_.end(), passing_boxes_d_.begin(), IsScoreNonZero{});
-  const auto num_passing = static_cast<std::size_t>(passing_end - passing_boxes_d_.begin());
+  const int grid = (num_proposals + k_block_size - 1) / k_block_size;
+  compactSortedBoxesKernel<<<grid, k_block_size, num_proposals * sizeof(float), stream>>>(
+    thrust::raw_pointer_cast(raw_boxes_d_.data()), num_proposals,
+    thrust::raw_pointer_cast(passing_boxes_d_.data()), num_boxes_d_.get());
 
-  if (num_passing == 0) {
-    return cudaGetLastError();
+  cudaError_t err = cudaMemcpyAsync(
+    num_boxes_h_.get(), num_boxes_d_.get(), sizeof(int), cudaMemcpyDeviceToHost, stream);
+  if (err != cudaSuccess) {
+    return err;
   }
-
-  thrust::sort(policy, passing_boxes_d_.begin(), passing_end, IsScoreGreaterThan{});
-
-  num_boxes_ = static_cast<std::size_t>(num_passing);
+  err = cudaMemcpyAsync(
+    boxes_h_.get(), thrust::raw_pointer_cast(passing_boxes_d_.data()),
+    config_.num_proposals_ * sizeof(Box3D), cudaMemcpyDeviceToHost, stream);
+  if (err != cudaSuccess) {
+    return err;
+  }
   return cudaGetLastError();
 }
 

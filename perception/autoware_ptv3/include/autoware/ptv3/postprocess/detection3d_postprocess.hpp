@@ -76,11 +76,18 @@ public:
   }
 
   /**
-   * @brief Return the number of boxes from the last process() call.
+   * @brief Return host pointer to the score-sorted boxes, valid once the stream passed to
+   * process() has been synchronized.
+   */
+  [[nodiscard]] const Box3D * hostBoxes() const { return boxes_h_.get(); }
+
+  /**
+   * @brief Return the number of boxes from the last process() call, valid once its stream has
+   * been synchronized.
    *
    * @return Number of decoded boxes kept after filtering.
    */
-  [[nodiscard]] std::size_t numBoxes() const { return num_boxes_; }
+  [[nodiscard]] std::size_t numBoxes() const { return static_cast<std::size_t>(*num_boxes_h_); }
 
 private:
   PTv3Config config_;
@@ -92,8 +99,10 @@ private:
   autoware::cuda_utils::CudaUniquePtr<float[]> post_center_range_d_{nullptr};
   autoware::cuda_utils::CudaUniquePtr<float[]> score_thresholds_d_{nullptr};
   autoware::cuda_utils::CudaUniquePtr<float[]> dist_bin_limits_d_{nullptr};
+  autoware::cuda_utils::CudaUniquePtr<int> num_boxes_d_{nullptr};
 
-  std::size_t num_boxes_{0};
+  autoware::cuda_utils::CudaUniquePtrHost<int> num_boxes_h_{nullptr};
+  autoware::cuda_utils::CudaUniquePtrHost<Box3D[]> boxes_h_{nullptr};
 };
 
 }  // namespace autoware::ptv3

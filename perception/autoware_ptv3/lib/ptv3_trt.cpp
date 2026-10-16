@@ -1148,18 +1148,11 @@ bool PTv3TRT::postProcessDetection3D(std::vector<Box3D> & detection_boxes)
     query_heatmap_score_d_.get(), query_labels_d_.get(), heatmap_d_.get(), center_d_.get(),
     height_d_.get(), dim_d_.get(), rot_d_.get(), config_.has_twist_ ? vel_d_.get() : nullptr,
     stream_));
-
-  const Box3D * device_boxes = detection3d_post_ptr_->deviceBoxes();
-  const std::size_t num_boxes = detection3d_post_ptr_->numBoxes();
-
-  detection_boxes.resize(num_boxes);
-  if (num_boxes == 0) {
-    return true;
-  }
-  CHECK_CUDA_ERROR(cudaMemcpyAsync(
-    detection_boxes.data(), device_boxes, num_boxes * sizeof(Box3D), cudaMemcpyDeviceToHost,
-    stream_));
   CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
+
+  const Box3D * host_boxes = detection3d_post_ptr_->hostBoxes();
+  const std::size_t num_boxes = detection3d_post_ptr_->numBoxes();
+  detection_boxes.assign(host_boxes, host_boxes + num_boxes);
   return true;
 }
 

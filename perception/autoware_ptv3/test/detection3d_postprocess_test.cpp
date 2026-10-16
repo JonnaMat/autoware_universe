@@ -19,7 +19,10 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace autoware::ptv3
@@ -27,7 +30,7 @@ namespace autoware::ptv3
 namespace test
 {
 
-PTv3Config makePostprocessConfig()
+PTv3Config makePostprocessConfig(const std::size_t num_proposals = 3)
 {
   PTv3ConfigParams params;
   params.use_seg3d_head = false;
@@ -43,57 +46,79 @@ PTv3Config makePostprocessConfig()
   params.distance_bin_upper_limits = {100.0F};
   params.detection_score_thresholds = {0.4F, 0.4F};
   params.yaw_norm_thresholds = {0.1F, 0.1F};
-  params.num_proposals = 3;
+  params.num_proposals = num_proposals;
   params.post_center_range = {-1.0F, -1.0F, -1.0F, 20.0F, 20.0F, 20.0F};
   return makeConfig(params);
 }
 
 class Detection3DPostprocessTest : public PTv3CudaTest
 {
+protected:
+  // Head outputs of one frame as the kernel reads them: [class][proposal] for the scores and
+  // the heatmap, [component][proposal] for center, dim, rot and vel.
+  struct HeadOutputs
+  {
+    std::vector<float> query_heatmap_score;
+    std::vector<std::int64_t> query_labels;
+    std::vector<float> heatmap;
+    std::vector<float> center;
+    std::vector<float> height;
+    std::vector<float> dim;
+    std::vector<float> rot;
+    std::vector<float> vel;
+  };
+
+  // Decodes one frame the way the node does: process(), one stream sync, hostBoxes(). The host
+  // copy is checked against the device boxes on the way.
+  std::vector<Box3D> decode(Detection3DPostprocess & postprocess, const HeadOutputs & in)
+  {
+    const auto upload = [this](const auto & host) {
+      using T = typename std::decay_t<decltype(host)>::value_type;
+      auto device = makeDeviceBuffer<T>(host.size());
+      copyToDevice(device.get(), host);
+      return device;
+    };
+    auto query_heatmap_score_d = upload(in.query_heatmap_score);
+    auto query_labels_d = upload(in.query_labels);
+    auto heatmap_d = upload(in.heatmap);
+    auto center_d = upload(in.center);
+    auto height_d = upload(in.height);
+    auto dim_d = upload(in.dim);
+    auto rot_d = upload(in.rot);
+    auto vel_d = upload(in.vel);
+    EXPECT_EQ(
+      postprocess.process(
+        query_heatmap_score_d.get(), query_labels_d.get(), heatmap_d.get(), center_d.get(),
+        height_d.get(), dim_d.get(), rot_d.get(), vel_d.get(), stream_),
+      cudaSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const auto num_boxes = postprocess.numBoxes();
+    std::vector<Box3D> boxes(postprocess.hostBoxes(), postprocess.hostBoxes() + num_boxes);
+    const auto device_boxes = copyToHost(postprocess.deviceBoxes(), num_boxes);
+    EXPECT_EQ(std::memcmp(boxes.data(), device_boxes.data(), num_boxes * sizeof(Box3D)), 0);
+    return boxes;
+  }
 };
 
 TEST_F(Detection3DPostprocessTest, DecodesFiltersAndSortsBoxes)
 {
-  const auto config = makePostprocessConfig();
-  Detection3DPostprocess postprocess(config, stream_);
+  Detection3DPostprocess postprocess(makePostprocessConfig(), stream_);
+  // Proposal 0: label 0, score 0.5; proposal 1: label 1, score 0.8; proposal 2: rejected.
+  const HeadOutputs in{
+    {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F},
+    {0, 1, -1},
+    {0.0F, 0.0F, 0.0F, 0.0F, 1.3862944F, 0.0F},
+    {1.0F, 0.5F, 0.0F, 1.0F, 0.5F, 0.0F},
+    {2.0F, 3.0F, 0.0F},
+    {std::log(2.0F), std::log(3.0F), 0.0F, std::log(1.0F), std::log(2.0F), 0.0F, std::log(2.0F),
+     std::log(1.0F), 0.0F},
+    {0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F},
+    {0.1F, 0.2F, 0.0F, 1.1F, 1.2F, 0.0F},
+  };
 
-  const std::vector<float> query_heatmap_score{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
-  const std::vector<std::int64_t> query_labels{0, 1, -1};
-  const std::vector<float> heatmap{0.0F, 0.0F, 0.0F, 0.0F, 1.3862944F, 0.0F};
-  const std::vector<float> center{1.0F, 0.5F, 0.0F, 1.0F, 0.5F, 0.0F};
-  const std::vector<float> height{2.0F, 3.0F, 0.0F};
-  const std::vector<float> dim{std::log(2.0F), std::log(3.0F), 0.0F,
-                               std::log(1.0F), std::log(2.0F), 0.0F,
-                               std::log(2.0F), std::log(1.0F), 0.0F};
-  const std::vector<float> rot{0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 1.0F};
-  const std::vector<float> vel{0.1F, 0.2F, 0.0F, 1.1F, 1.2F, 0.0F};
-
-  auto query_heatmap_score_d = makeDeviceBuffer<float>(query_heatmap_score.size());
-  auto query_labels_d = makeDeviceBuffer<std::int64_t>(query_labels.size());
-  auto heatmap_d = makeDeviceBuffer<float>(heatmap.size());
-  auto center_d = makeDeviceBuffer<float>(center.size());
-  auto height_d = makeDeviceBuffer<float>(height.size());
-  auto dim_d = makeDeviceBuffer<float>(dim.size());
-  auto rot_d = makeDeviceBuffer<float>(rot.size());
-  auto vel_d = makeDeviceBuffer<float>(vel.size());
-  copyToDevice(query_heatmap_score_d.get(), query_heatmap_score);
-  copyToDevice(query_labels_d.get(), query_labels);
-  copyToDevice(heatmap_d.get(), heatmap);
-  copyToDevice(center_d.get(), center);
-  copyToDevice(height_d.get(), height);
-  copyToDevice(dim_d.get(), dim);
-  copyToDevice(rot_d.get(), rot);
-  copyToDevice(vel_d.get(), vel);
-
-  EXPECT_EQ(
-    postprocess.process(
-      query_heatmap_score_d.get(), query_labels_d.get(), heatmap_d.get(), center_d.get(),
-      height_d.get(), dim_d.get(), rot_d.get(), vel_d.get(), stream_),
-    cudaSuccess);
-  ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-
-  ASSERT_EQ(postprocess.numBoxes(), 2U);
-  const auto boxes = copyToHost(postprocess.deviceBoxes(), postprocess.numBoxes());
+  const auto boxes = decode(postprocess, in);
+  ASSERT_EQ(boxes.size(), 2U);
   EXPECT_EQ(boxes[0].label, 1);
   EXPECT_NEAR(boxes[0].score, 0.8F, 1e-5F);
   EXPECT_FLOAT_EQ(boxes[0].x, 4.0F);
@@ -104,6 +129,43 @@ TEST_F(Detection3DPostprocessTest, DecodesFiltersAndSortsBoxes)
   EXPECT_NEAR(boxes[1].score, 0.5F, 1e-5F);
   EXPECT_FLOAT_EQ(boxes[1].x, 8.0F);
   EXPECT_FLOAT_EQ(boxes[1].y, 8.0F);
+}
+
+TEST_F(Detection3DPostprocessTest, TiesKeepProposalOrderPastARejectedProposal)
+{
+  Detection3DPostprocess postprocess(makePostprocessConfig(4), stream_);
+  // Proposal 0: rejected; proposal 1: score 0.8; proposals 2 and 3: label 0, both score 0.5.
+  const HeadOutputs in{
+    {0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F},
+    {-1, 1, 0, 0},
+    {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.3862944F, 0.0F, 0.0F},
+    {0.0F, 0.5F, 1.0F, 0.0F, 0.0F, 0.5F, 1.0F, 0.0F},
+    {0.0F, 3.0F, 2.0F, 0.0F},
+    {0.0F, std::log(3.0F), std::log(2.0F), std::log(2.0F), 0.0F, std::log(2.0F), std::log(1.0F),
+     std::log(1.0F), 0.0F, std::log(1.0F), std::log(2.0F), std::log(2.0F)},
+    {0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 1.0F},
+    {0.0F, 0.2F, 0.1F, 0.3F, 0.0F, 1.2F, 1.1F, 1.3F},
+  };
+
+  // Score order first, proposal order among the ties; the rejected proposal neither counts nor
+  // shifts a rank.
+  const auto boxes = decode(postprocess, in);
+  ASSERT_EQ(boxes.size(), 3U);
+  EXPECT_NEAR(boxes[0].score, 0.8F, 1e-5F);
+  EXPECT_FLOAT_EQ(boxes[0].x, 4.0F);
+  EXPECT_NEAR(boxes[1].score, 0.5F, 1e-5F);
+  EXPECT_FLOAT_EQ(boxes[1].x, 8.0F);
+  EXPECT_NEAR(boxes[2].score, 0.5F, 1e-5F);
+  EXPECT_FLOAT_EQ(boxes[2].x, 0.0F);
+}
+
+TEST_F(Detection3DPostprocessTest, RejectsProposalCountsBeyondTheSharedMemoryLimit)
+{
+  // The compaction kernel stages num_proposals floats in dynamic shared memory, 48 KB at most.
+  constexpr std::size_t kLimit = 48 * 1024 / sizeof(float);
+  EXPECT_NO_THROW(Detection3DPostprocess(makePostprocessConfig(kLimit), stream_));
+  EXPECT_THROW(
+    Detection3DPostprocess(makePostprocessConfig(kLimit + 1), stream_), std::runtime_error);
 }
 
 }  // namespace test
